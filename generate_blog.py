@@ -1,26 +1,25 @@
 """
 AI-migo Blog Generator — FastAPI backend
-POST /generate  →  generates a full blog HTML from subject, picture, context
+POST /generate  →  returns a ZIP containing index.html + assets/
 """
 
+import io
 import json
 import os
 import re
-import shutil
+import zipfile
 from datetime import date
 from pathlib import Path
 
 import anthropic
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-OUTPUT_DIR = Path("output")          # generated blogs land here: output/<slug>/
 TEMPLATE_PATH = Path("blog-template.html")
 
 app = FastAPI(title="AI-migo Blog Generator")
@@ -31,10 +30,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Serve the output folder so generated blogs are preview-able
-OUTPUT_DIR.mkdir(exist_ok=True)
-app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +47,7 @@ def slugify(text: str) -> str:
     text = re.sub(r"[ñ]", "n", text)
     text = re.sub(r"[ç]", "c", text)
     text = re.sub(r"[^a-z0-9\s-]", "", text)
-    text = re.sub(r"[\s]+", "-", text.strip())
+    text = re.sub(r"\s+", "-", text.strip())
     return text[:80]
 
 
@@ -148,27 +143,27 @@ inclusief stat-band, blockquote, faq-sectie en de afsluitende <hr> + slotparagra
 def fill_template(template: str, data: dict, slug: str, image_filename: str) -> str:
     today = date.today().isoformat()
     replacements = {
-        "{{META_TITLE}}": data["meta_title"],
+        "{{META_TITLE}}":       data["meta_title"],
         "{{META_DESCRIPTION}}": data["meta_description"],
-        "{{META_KEYWORDS}}": data["meta_keywords"],
-        "{{OG_TITLE}}": data["og_title"],
-        "{{OG_DESCRIPTION}}": data["og_description"],
-        "{{OG_IMAGE_ALT}}": data["og_image_alt"],
-        "{{SCHEMA_HEADLINE}}": data["schema_headline"],
-        "{{ARTICLE_SECTION}}": data["article_section"],
-        "{{DATE_ISO}}": today,
-        "{{DATE_NL}}": dutch_date(today),
-        "{{SLUG}}": slug,
-        "{{IMAGE_FILENAME}}": image_filename,
-        "{{IMAGE_ALT}}": data["image_alt"],
-        "{{EYEBROW}}": data["eyebrow"],
-        "{{H1}}": data["h1"],
-        "{{DEK}}": data["dek"],
-        "{{READ_TIME}}": str(data["read_time"]),
-        "{{BODY_HTML}}": data["body_html"],
-        "{{CTA_TITLE}}": data["cta_title"],
-        "{{CTA_BODY}}": data["cta_body"],
-        "{{FAQ_SCHEMA}}": json.dumps(data["faq_schema"], ensure_ascii=False, indent=2),
+        "{{META_KEYWORDS}}":    data["meta_keywords"],
+        "{{OG_TITLE}}":         data["og_title"],
+        "{{OG_DESCRIPTION}}":   data["og_description"],
+        "{{OG_IMAGE_ALT}}":     data["og_image_alt"],
+        "{{SCHEMA_HEADLINE}}":  data["schema_headline"],
+        "{{ARTICLE_SECTION}}":  data["article_section"],
+        "{{DATE_ISO}}":         today,
+        "{{DATE_NL}}":          dutch_date(today),
+        "{{SLUG}}":             slug,
+        "{{IMAGE_FILENAME}}":   image_filename,
+        "{{IMAGE_ALT}}":        data["image_alt"],
+        "{{EYEBROW}}":          data["eyebrow"],
+        "{{H1}}":               data["h1"],
+        "{{DEK}}":              data["dek"],
+        "{{READ_TIME}}":        str(data["read_time"]),
+        "{{BODY_HTML}}":        data["body_html"],
+        "{{CTA_TITLE}}":        data["cta_title"],
+        "{{CTA_BODY}}":         data["cta_body"],
+        "{{FAQ_SCHEMA}}":       json.dumps(data["faq_schema"], ensure_ascii=False, indent=2),
     }
     for token, value in replacements.items():
         template = template.replace(token, value)
@@ -185,27 +180,14 @@ async def generate_blog(
     context: str = Form(""),
     picture: UploadFile = File(...),
 ):
-    # 1. Slug + paths
+    # 1. Slug
     slug = slugify(subject)
     if not slug:
         raise HTTPException(status_code=400, detail="Ongeldig onderwerp voor slug.")
 
-    blog_dir = OUTPUT_DIR / slug
-    assets_dir = blog_dir / "assets"
-    blog_dir.mkdir(parents=True, exist_ok=True)
-    assets_dir.mkdir(exist_ok=True)
-
-    # 2. Save uploaded image
-    image_filename = picture.filename or "blog_picture.jpg"
-    image_filename = re.sub(r"[^\w.\-]", "_", image_filename)
-    image_path = assets_dir / image_filename
-    with open(image_path, "wb") as fh:
-        shutil.copyfileobj(picture.file, fh)
-
-    # Also copy logo so the blog renders standalone
-    logo_src = Path("assets/aimigo_logo.png")
-    if logo_src.exists():
-        shutil.copy(logo_src, assets_dir / "aimigo_logo.png")
+    # 2. Read uploaded image into memory
+    image_bytes = await picture.read()
+    image_filename = re.sub(r"[^\w.\-]", "_", picture.filename or "blog_picture.jpg")
 
     # 3. Call Claude
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -221,8 +203,6 @@ async def generate_blog(
         raise HTTPException(status_code=502, detail=f"Claude API fout: {exc}") from exc
 
     raw = message.content[0].text.strip()
-
-    # Strip markdown code fences if Claude added them
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"```\s*$", "", raw)
 
@@ -238,23 +218,30 @@ async def generate_blog(
     template_html = TEMPLATE_PATH.read_text(encoding="utf-8")
     output_html = fill_template(template_html, data, slug, image_filename)
 
-    # Fix relative asset paths so the standalone blog finds the logo
-    output_html = output_html.replace(
-        "https://ai-migo.nl/assets/aimigo_logo.png",
-        "assets/aimigo_logo.png",
+    # 5. Build ZIP in memory: <slug>/index.html + <slug>/assets/<image>
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{slug}/index.html", output_html.encode("utf-8"))
+        zf.writestr(f"{slug}/assets/{image_filename}", image_bytes)
+
+        # Bundle the logo too so the blog renders offline / standalone
+        logo_path = Path("assets/aimigo_logo.png")
+        if logo_path.exists():
+            zf.write(logo_path, f"{slug}/assets/aimigo_logo.png")
+
+    zip_buffer.seek(0)
+
+    # 6. Stream ZIP back to the browser as a download
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{slug}.zip"',
+            "X-Slug": slug,
+            "X-Read-Time": str(data.get("read_time", "")),
+            "X-Meta-Title": data.get("meta_title", ""),
+        },
     )
-
-    # 5. Write output
-    output_path = blog_dir / "index.html"
-    output_path.write_text(output_html, encoding="utf-8")
-
-    return JSONResponse({
-        "slug": slug,
-        "preview_url": f"/output/{slug}/index.html",
-        "output_path": str(output_path),
-        "read_time": data.get("read_time"),
-        "meta_title": data.get("meta_title"),
-    })
 
 
 # ---------------------------------------------------------------------------
