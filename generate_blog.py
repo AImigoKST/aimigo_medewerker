@@ -210,6 +210,18 @@ def fill_template(template: str, data: dict, slug: str, image_filename: str) -> 
     return template
 
 
+def sftp_mkdir_p(sftp: paramiko.SFTPClient, remote_path: str):
+    """Create remote directory and every missing parent, like mkdir -p."""
+    parts = remote_path.strip("/").split("/")
+    current = ""
+    for part in parts:
+        current += f"/{part}"
+        try:
+            sftp.mkdir(current)
+        except OSError:
+            pass  # already exists — continue
+
+
 def sftp_upload(slug: str, html: str, image_bytes: bytes, image_filename: str):
     """Upload index.html + assets to Strato via SFTP."""
     transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
@@ -219,22 +231,19 @@ def sftp_upload(slug: str, html: str, image_bytes: bytes, image_filename: str):
     blog_dir   = f"{SFTP_BLOG_PATH}/{slug}"
     assets_dir = f"{blog_dir}/assets"
 
-    # Create directories (ignore error if they already exist)
-    for folder in [blog_dir, assets_dir]:
-        try:
-            sftp.mkdir(folder)
-        except OSError:
-            pass
+    # Create full directory tree, parent by parent
+    sftp_mkdir_p(sftp, blog_dir)
+    sftp_mkdir_p(sftp, assets_dir)
 
-    # Upload index.html
-    with sftp.open(f"{blog_dir}/index.html", "w") as fh:
-        fh.write(html)
+    # Upload index.html (write as bytes for reliability)
+    with sftp.open(f"{blog_dir}/index.html", "wb") as fh:
+        fh.write(html.encode("utf-8"))
 
     # Upload blog image
     with sftp.open(f"{assets_dir}/{image_filename}", "wb") as fh:
         fh.write(image_bytes)
 
-    # Upload logo (read from local disk on Render)
+    # Upload logo
     logo_path = Path("assets/aimigo_logo.png")
     if logo_path.exists():
         sftp.put(str(logo_path), f"{assets_dir}/aimigo_logo.png")
