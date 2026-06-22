@@ -7,7 +7,7 @@ import io
 import json
 import os
 import re
-import zipfileA
+import zipfile
 from datetime import date
 from pathlib import Path
 
