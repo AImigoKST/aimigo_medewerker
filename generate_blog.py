@@ -1,25 +1,32 @@
 """
 AI-migo Blog Generator — FastAPI backend
-POST /generate  →  returns a ZIP containing index.html + assets/
+POST /generate  →  generates blog HTML, caches it, returns JSON
+POST /publish   →  SFTPs cached blog to Strato
 """
 
 import io
 import json
 import os
 import re
-import zipfile
 from datetime import date
 from pathlib import Path
 
 import anthropic
+import paramiko
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+SFTP_HOST         = os.environ.get("SFTP_HOST", "")
+SFTP_USER         = os.environ.get("SFTP_USER", "")
+SFTP_PASS         = os.environ.get("SFTP_PASS", "")
+SFTP_BLOG_PATH    = os.environ.get("SFTP_BLOG_PATH", "/www.ai-migo.nl/blog")
+SFTP_PORT         = 22
+
 TEMPLATE_PATH = Path("blog-template.html")
 
 app = FastAPI(title="AI-migo Blog Generator")
@@ -29,8 +36,11 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Slug", "X-Read-Time"],
 )
+
+# In-memory cache: slug → { html, image_bytes, image_filename }
+# Safe on Render with WEB_CONCURRENCY=1 (single worker)
+blog_cache: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +104,8 @@ def build_prompt(subject: str, context: str, image_filename: str, slug: str,
     structure_lines.append("   - Een afsluitende paragraaf voor de <hr>")
     structure_block = "\n".join(structure_lines)
 
-    if include_faq:
-        faq_schema_instruction = """  "faq_schema": {
+    faq_schema_instruction = (
+        """  "faq_schema": {
     "@context": "https://schema.org",
     "@type": "FAQPage",
     "mainEntity": [
@@ -106,8 +116,8 @@ def build_prompt(subject: str, context: str, image_filename: str, slug: str,
       }
     ]
   }"""
-    else:
-        faq_schema_instruction = '  "faq_schema": null'
+        if include_faq else '  "faq_schema": null'
+    )
 
     return f"""Je bent een senior SEO-copywriter en content-specialist voor AI-migo (ai-migo.nl).
 AI-migo bouwt AI-chatbots voor het Nederlandse MKB. De doelgroep zijn Nederlandse MKB-ondernemers
@@ -169,9 +179,8 @@ inclusief de afsluitende <hr> + slotparagraaf.
 
 def fill_template(template: str, data: dict, slug: str, image_filename: str) -> str:
     today = date.today().isoformat()
-
     faq_schema_value = data.get("faq_schema")
-    faq_schema_json = json.dumps(faq_schema_value, ensure_ascii=False, indent=2) if faq_schema_value else "{}"
+    faq_schema_json  = json.dumps(faq_schema_value, ensure_ascii=False, indent=2) if faq_schema_value else "{}"
 
     replacements = {
         "{{META_TITLE}}":       data["meta_title"],
@@ -201,8 +210,41 @@ def fill_template(template: str, data: dict, slug: str, image_filename: str) -> 
     return template
 
 
+def sftp_upload(slug: str, html: str, image_bytes: bytes, image_filename: str):
+    """Upload index.html + assets to Strato via SFTP."""
+    transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+    transport.connect(username=SFTP_USER, password=SFTP_PASS)
+    sftp = paramiko.SFTPClient.from_transport(transport)
+
+    blog_dir   = f"{SFTP_BLOG_PATH}/{slug}"
+    assets_dir = f"{blog_dir}/assets"
+
+    # Create directories (ignore error if they already exist)
+    for folder in [blog_dir, assets_dir]:
+        try:
+            sftp.mkdir(folder)
+        except OSError:
+            pass
+
+    # Upload index.html
+    with sftp.open(f"{blog_dir}/index.html", "w") as fh:
+        fh.write(html)
+
+    # Upload blog image
+    with sftp.open(f"{assets_dir}/{image_filename}", "wb") as fh:
+        fh.write(image_bytes)
+
+    # Upload logo (read from local disk on Render)
+    logo_path = Path("assets/aimigo_logo.png")
+    if logo_path.exists():
+        sftp.put(str(logo_path), f"{assets_dir}/aimigo_logo.png")
+
+    sftp.close()
+    transport.close()
+
+
 # ---------------------------------------------------------------------------
-# Endpoint
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @app.post("/generate")
@@ -244,34 +286,55 @@ async def generate_blog(
     except json.JSONDecodeError as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Claude gaf geen geldig JSON terug: {exc}\n\nRaw output (eerste 500 tekens):\n{raw[:500]}",
+            detail=f"Claude gaf geen geldig JSON terug: {exc}\n\nRaw output:\n{raw[:500]}",
         ) from exc
 
     template_html = TEMPLATE_PATH.read_text(encoding="utf-8")
     output_html   = fill_template(template_html, data, slug, image_filename)
 
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(f"{slug}/index.html", output_html.encode("utf-8"))
-        zf.writestr(f"{slug}/assets/{image_filename}", image_bytes)
-        logo_path = Path("assets/aimigo_logo.png")
-        if logo_path.exists():
-            zf.write(logo_path, f"{slug}/assets/aimigo_logo.png")
+    # Cache for /publish
+    blog_cache[slug] = {
+        "html":           output_html,
+        "image_bytes":    image_bytes,
+        "image_filename": image_filename,
+        "read_time":      data.get("read_time", "?"),
+    }
 
-    zip_buffer.seek(0)
-    zip_bytes = zip_buffer.read()
+    return JSONResponse({
+        "slug":      slug,
+        "html":      output_html,
+        "read_time": data.get("read_time", "?"),
+    })
 
-    # Only ASCII-safe values in headers to avoid corrupting the response
-    return StreamingResponse(
-        io.BytesIO(zip_bytes),
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{slug}.zip"',
-            "Content-Length": str(len(zip_bytes)),
-            "X-Slug":      slug,
-            "X-Read-Time": str(data.get("read_time", "")),
-        },
-    )
+
+@app.post("/publish")
+async def publish_blog(slug: str = Form(...)):
+    entry = blog_cache.get(slug)
+    if not entry:
+        raise HTTPException(
+            status_code=404,
+            detail="Blog niet gevonden in cache. Genereer de blog opnieuw en probeer dan te publiceren.",
+        )
+
+    if not SFTP_HOST or not SFTP_USER or not SFTP_PASS:
+        raise HTTPException(status_code=500, detail="SFTP-instellingen ontbreken op de server.")
+
+    try:
+        sftp_upload(
+            slug           = slug,
+            html           = entry["html"],
+            image_bytes    = entry["image_bytes"],
+            image_filename = entry["image_filename"],
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"SFTP-upload mislukt: {exc}") from exc
+
+    # Remove from cache after successful publish
+    blog_cache.pop(slug, None)
+
+    return JSONResponse({
+        "url": f"https://ai-migo.nl/blog/{slug}/",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +343,7 @@ async def generate_blog(
 
 @app.get("/")
 def root():
-    return {"status": "AI-migo Blog Generator draait. POST naar /generate."}
+    return {"status": "AI-migo Blog Generator draait. POST naar /generate of /publish."}
 
 
 # ---------------------------------------------------------------------------
