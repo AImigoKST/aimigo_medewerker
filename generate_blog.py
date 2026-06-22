@@ -29,6 +29,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Slug", "X-Read-Time"],
 )
 
 
@@ -67,7 +68,6 @@ def build_prompt(subject: str, context: str, image_filename: str, slug: str,
     with open("index.html", encoding="utf-8") as fh:
         reference_html = fh.read()
 
-    # Build the structure requirement based on checkboxes
     structure_lines = [
         "   - Intro-paragraaf met <strong>-accenten en een bronvermelding <span class=\"source\">(...)</span>",
     ]
@@ -76,27 +76,24 @@ def build_prompt(subject: str, context: str, image_filename: str, slug: str,
             "   - 3 stat-kaarten in een <div class=\"stat-band\"> met echte of aannemelijke statistieken"
         )
     else:
-        structure_lines.append(
-            "   - GEEN stat-band of statistiekenblok opnemen"
-        )
+        structure_lines.append("   - GEEN stat-band of statistiekenblok opnemen")
+
     structure_lines += [
         "   - Meerdere H2-secties met inhoudelijke uitleg",
         "   - Minimaal één <blockquote>-citaat (pakkende inzicht, geen directe quote van een persoon)",
         "   - Minimaal één genummerde of ongenummerde lijst",
     ]
+
     if include_faq:
         structure_lines.append(
             "   - Een <div class=\"faq\"> met 4–5 <details>/<summary>-vragen"
         )
     else:
-        structure_lines.append(
-            "   - GEEN FAQ-sectie opnemen"
-        )
-    structure_lines.append("   - Een afsluitende paragraaf voor de <hr>")
+        structure_lines.append("   - GEEN FAQ-sectie opnemen")
 
+    structure_lines.append("   - Een afsluitende paragraaf voor de <hr>")
     structure_block = "\n".join(structure_lines)
 
-    # Build the faq_schema instruction
     if include_faq:
         faq_schema_instruction = """  "faq_schema": {
     "@context": "https://schema.org",
@@ -220,7 +217,6 @@ async def generate_blog(
     if not slug:
         raise HTTPException(status_code=400, detail="Ongeldig onderwerp voor slug.")
 
-    # Checkboxes send "1" when checked, empty string when unchecked
     want_stats = include_stats == "1"
     want_faq   = include_faq == "1"
 
@@ -263,15 +259,17 @@ async def generate_blog(
             zf.write(logo_path, f"{slug}/assets/aimigo_logo.png")
 
     zip_buffer.seek(0)
+    zip_bytes = zip_buffer.read()
 
+    # Only ASCII-safe values in headers to avoid corrupting the response
     return StreamingResponse(
-        zip_buffer,
+        io.BytesIO(zip_bytes),
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{slug}.zip"',
-            "X-Slug":       slug,
-            "X-Read-Time":  str(data.get("read_time", "")),
-            "X-Meta-Title": data.get("meta_title", ""),
+            "Content-Length": str(len(zip_bytes)),
+            "X-Slug":      slug,
+            "X-Read-Time": str(data.get("read_time", "")),
         },
     )
 
