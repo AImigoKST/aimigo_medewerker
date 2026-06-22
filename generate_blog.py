@@ -222,8 +222,29 @@ def sftp_mkdir_p(sftp: paramiko.SFTPClient, remote_path: str):
             pass  # already exists — continue
 
 
-def sftp_upload(slug: str, html: str, image_bytes: bytes, image_filename: str):
-    """Upload index.html + assets to Strato via SFTP."""
+def build_card_html(slug: str, image_filename: str, tag: str, title: str,
+                    excerpt: str, date_nl: str, read_time) -> str:
+    """Build a single blog-card <a> element for the landing page."""
+    return (
+        f'\n    <a class="blog-card" href="https://ai-migo.nl/blog/{slug}/">\n'
+        f'      <img class="blog-card-img" src="{slug}/assets/{image_filename}"'
+        f' alt="{title}" width="800" height="450" loading="lazy" decoding="async">\n'
+        f'      <div class="blog-card-body">\n'
+        f'        <span class="blog-card-tag">{tag}</span>\n'
+        f'        <h2 class="blog-card-title">{title}</h2>\n'
+        f'        <p class="blog-card-excerpt">{excerpt}</p>\n'
+        f'        <div class="blog-card-meta">\n'
+        f'          <span class="blog-card-date">{date_nl}</span>\n'
+        f'          <span class="blog-card-read">Lees artikel →</span>\n'
+        f'        </div>\n'
+        f'      </div>\n'
+        f'    </a>\n'
+    )
+
+
+def sftp_upload(slug: str, html: str, image_bytes: bytes, image_filename: str,
+                card_html: str):
+    """Upload blog files to Strato and prepend card to the landing page."""
     transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
     transport.connect(username=SFTP_USER, password=SFTP_PASS)
     sftp = paramiko.SFTPClient.from_transport(transport)
@@ -235,7 +256,7 @@ def sftp_upload(slug: str, html: str, image_bytes: bytes, image_filename: str):
     sftp_mkdir_p(sftp, blog_dir)
     sftp_mkdir_p(sftp, assets_dir)
 
-    # Upload index.html (write as bytes for reliability)
+    # Upload index.html
     with sftp.open(f"{blog_dir}/index.html", "wb") as fh:
         fh.write(html.encode("utf-8"))
 
@@ -247,6 +268,22 @@ def sftp_upload(slug: str, html: str, image_bytes: bytes, image_filename: str):
     logo_path = Path("assets/aimigo_logo.png")
     if logo_path.exists():
         sftp.put(str(logo_path), f"{assets_dir}/aimigo_logo.png")
+
+    # ── Update blog landing page ──────────────────────────────────────────
+    landing_path = f"{SFTP_BLOG_PATH}/index.html"
+
+    # Download current landing page
+    with sftp.open(landing_path, "rb") as fh:
+        landing_html = fh.read().decode("utf-8")
+
+    # Insert new card right after the opening <div class="blog-grid"> tag
+    marker = '<div class="blog-grid">'
+    if marker in landing_html:
+        landing_html = landing_html.replace(marker, marker + card_html, 1)
+
+    # Upload updated landing page
+    with sftp.open(landing_path, "wb") as fh:
+        fh.write(landing_html.encode("utf-8"))
 
     sftp.close()
     transport.close()
@@ -307,6 +344,10 @@ async def generate_blog(
         "image_bytes":    image_bytes,
         "image_filename": image_filename,
         "read_time":      data.get("read_time", "?"),
+        "title":          data.get("h1", subject),
+        "excerpt":        data.get("meta_description", data.get("dek", "")),
+        "tag":            data.get("article_section", "AI"),
+        "date_nl":        dutch_date(date.today().isoformat()),
     }
 
     return JSONResponse({
@@ -328,12 +369,23 @@ async def publish_blog(slug: str = Form(...)):
     if not SFTP_HOST or not SFTP_USER or not SFTP_PASS:
         raise HTTPException(status_code=500, detail="SFTP-instellingen ontbreken op de server.")
 
+    card_html = build_card_html(
+        slug           = slug,
+        image_filename = entry["image_filename"],
+        tag            = entry["tag"],
+        title          = entry["title"],
+        excerpt        = entry["excerpt"],
+        date_nl        = entry["date_nl"],
+        read_time      = entry["read_time"],
+    )
+
     try:
         sftp_upload(
             slug           = slug,
             html           = entry["html"],
             image_bytes    = entry["image_bytes"],
             image_filename = entry["image_filename"],
+            card_html      = card_html,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"SFTP-upload mislukt: {exc}") from exc
