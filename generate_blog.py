@@ -7,7 +7,7 @@ import io
 import json
 import os
 import re
-import zipfile
+import zipfileA
 from datetime import date
 from pathlib import Path
 
@@ -60,11 +60,57 @@ def dutch_date(iso: str) -> str:
     return f"{int(d)} {months[int(m)]} {y}"
 
 
-def build_prompt(subject: str, context: str, image_filename: str, slug: str) -> str:
+def build_prompt(subject: str, context: str, image_filename: str, slug: str,
+                 include_stats: bool = False, include_faq: bool = False) -> str:
     today = date.today().isoformat()
 
     with open("index.html", encoding="utf-8") as fh:
         reference_html = fh.read()
+
+    # Build the structure requirement based on checkboxes
+    structure_lines = [
+        "   - Intro-paragraaf met <strong>-accenten en een bronvermelding <span class=\"source\">(...)</span>",
+    ]
+    if include_stats:
+        structure_lines.append(
+            "   - 3 stat-kaarten in een <div class=\"stat-band\"> met echte of aannemelijke statistieken"
+        )
+    else:
+        structure_lines.append(
+            "   - GEEN stat-band of statistiekenblok opnemen"
+        )
+    structure_lines += [
+        "   - Meerdere H2-secties met inhoudelijke uitleg",
+        "   - Minimaal één <blockquote>-citaat (pakkende inzicht, geen directe quote van een persoon)",
+        "   - Minimaal één genummerde of ongenummerde lijst",
+    ]
+    if include_faq:
+        structure_lines.append(
+            "   - Een <div class=\"faq\"> met 4–5 <details>/<summary>-vragen"
+        )
+    else:
+        structure_lines.append(
+            "   - GEEN FAQ-sectie opnemen"
+        )
+    structure_lines.append("   - Een afsluitende paragraaf voor de <hr>")
+
+    structure_block = "\n".join(structure_lines)
+
+    # Build the faq_schema instruction
+    if include_faq:
+        faq_schema_instruction = """  "faq_schema": {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "...",
+        "acceptedAnswer": { "@type": "Answer", "text": "..." }
+      }
+    ]
+  }"""
+    else:
+        faq_schema_instruction = '  "faq_schema": null'
 
     return f"""Je bent een senior SEO-copywriter en content-specialist voor AI-migo (ai-migo.nl).
 AI-migo bouwt AI-chatbots voor het Nederlandse MKB. De doelgroep zijn Nederlandse MKB-ondernemers
@@ -80,7 +126,7 @@ AFBEELDINGSBESTANDSNAAM: {image_filename}
 
 ---
 
-REFERENTIE-BLOG (exact deze structuur en stijl aanhouden):
+REFERENTIE-BLOG (gebruik voor stijl, CSS-klassen en opmaak — maar volg de structuur hieronder):
 {reference_html}
 
 ---
@@ -89,13 +135,7 @@ VEREISTEN:
 1. Lengte: 1200–2000 woorden in de article-body (4–10 minuten leestijd). Schat de leestijd zelf (200 wpm).
 2. Taal: volledig Nederlands, informele maar professionele toon (je/jij).
 3. Structuur (verplicht in deze volgorde):
-   - Intro-paragraaf met <strong>-accenten en een bronvermelding <span class="source">(...)</span>
-   - 3 stat-kaarten in een <div class="stat-band"> met echte of aannemelijke statistieken
-   - Meerdere H2-secties met inhoudelijke uitleg
-   - Minimaal één <blockquote>-citaat (pakkende inzicht, geen directe quote van een persoon)
-   - Minimaal één genummerde of ongenummerde lijst
-   - Een <div class="faq"> met 4–5 <details>/<summary>-vragen
-   - Een afsluitende paragraaf voor de <hr>
+{structure_block}
 4. Interne links: verwijzing naar https://ai-migo.nl/#contact, https://ai-migo.nl/#pricing en https://ai-migo.nl/#home waar relevant.
 5. Gebruik <span class="source">(...)</span> voor bronvermeldingen.
 6. Gebruik GEEN markdown in de HTML-output — alleen raw HTML-tags.
@@ -122,26 +162,20 @@ Geef je antwoord UITSLUITEND als één geldig JSON-object met exact de volgende 
   "body_html": "...",
   "cta_title": "...",
   "cta_body": "...",
-  "faq_schema": {{
-    "@context": "https://schema.org",
-    "@type": "FAQPage",
-    "mainEntity": [
-      {{
-        "@type": "Question",
-        "name": "...",
-        "acceptedAnswer": {{ "@type": "Answer", "text": "..." }}
-      }}
-    ]
-  }}
+{faq_schema_instruction}
 }}
 
 Zorg dat body_html alle HTML bevat die tussen <div class="article-body"> en </div> hoort,
-inclusief stat-band, blockquote, faq-sectie en de afsluitende <hr> + slotparagraaf.
+inclusief de afsluitende <hr> + slotparagraaf.
 """
 
 
 def fill_template(template: str, data: dict, slug: str, image_filename: str) -> str:
     today = date.today().isoformat()
+
+    faq_schema_value = data.get("faq_schema")
+    faq_schema_json = json.dumps(faq_schema_value, ensure_ascii=False, indent=2) if faq_schema_value else "{}"
+
     replacements = {
         "{{META_TITLE}}":       data["meta_title"],
         "{{META_DESCRIPTION}}": data["meta_description"],
@@ -163,7 +197,7 @@ def fill_template(template: str, data: dict, slug: str, image_filename: str) -> 
         "{{BODY_HTML}}":        data["body_html"],
         "{{CTA_TITLE}}":        data["cta_title"],
         "{{CTA_BODY}}":         data["cta_body"],
-        "{{FAQ_SCHEMA}}":       json.dumps(data["faq_schema"], ensure_ascii=False, indent=2),
+        "{{FAQ_SCHEMA}}":       faq_schema_json,
     }
     for token, value in replacements.items():
         template = template.replace(token, value)
@@ -179,19 +213,22 @@ async def generate_blog(
     subject: str = Form(...),
     context: str = Form(""),
     picture: UploadFile = File(...),
+    include_stats: str = Form(""),
+    include_faq: str = Form(""),
 ):
-    # 1. Slug
     slug = slugify(subject)
     if not slug:
         raise HTTPException(status_code=400, detail="Ongeldig onderwerp voor slug.")
 
-    # 2. Read uploaded image into memory
-    image_bytes = await picture.read()
+    # Checkboxes send "1" when checked, empty string when unchecked
+    want_stats = include_stats == "1"
+    want_faq   = include_faq == "1"
+
+    image_bytes    = await picture.read()
     image_filename = re.sub(r"[^\w.\-]", "_", picture.filename or "blog_picture.jpg")
 
-    # 3. Call Claude
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    prompt = build_prompt(subject, context, image_filename, slug)
+    prompt = build_prompt(subject, context, image_filename, slug, want_stats, want_faq)
 
     try:
         message = client.messages.create(
@@ -214,31 +251,26 @@ async def generate_blog(
             detail=f"Claude gaf geen geldig JSON terug: {exc}\n\nRaw output (eerste 500 tekens):\n{raw[:500]}",
         ) from exc
 
-    # 4. Fill template
     template_html = TEMPLATE_PATH.read_text(encoding="utf-8")
-    output_html = fill_template(template_html, data, slug, image_filename)
+    output_html   = fill_template(template_html, data, slug, image_filename)
 
-    # 5. Build ZIP in memory: <slug>/index.html + <slug>/assets/<image>
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{slug}/index.html", output_html.encode("utf-8"))
         zf.writestr(f"{slug}/assets/{image_filename}", image_bytes)
-
-        # Bundle the logo too so the blog renders offline / standalone
         logo_path = Path("assets/aimigo_logo.png")
         if logo_path.exists():
             zf.write(logo_path, f"{slug}/assets/aimigo_logo.png")
 
     zip_buffer.seek(0)
 
-    # 6. Stream ZIP back to the browser as a download
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{slug}.zip"',
-            "X-Slug": slug,
-            "X-Read-Time": str(data.get("read_time", "")),
+            "X-Slug":       slug,
+            "X-Read-Time":  str(data.get("read_time", "")),
             "X-Meta-Title": data.get("meta_title", ""),
         },
     )
